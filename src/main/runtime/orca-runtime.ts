@@ -534,6 +534,7 @@ import {
   RUNTIME_CAPABILITIES,
   RUNTIME_PROTOCOL_VERSION,
   TERMINAL_PAIRED_PARKING_RUNTIME_CAPABILITY,
+  WORKSPACE_PORT_TUNNEL_RUNTIME_CAPABILITY,
   type RuntimeCapability
 } from '../../shared/protocol-version'
 import {
@@ -561,7 +562,9 @@ import {
   killWorkspacePort,
   scanWorkspacePortProbes
 } from '../ports/workspace-port-ownership'
+import type { WorkspacePortScanOptions } from '../ports/local-workspace-port-scanner'
 import { advertisedUrlWatcher } from '../ports/advertised-url-watcher'
+import { WorkspacePortTunnelGrantStore } from '../runtime-port-tunnel/workspace-port-tunnel-grant-store'
 import type { AutomationService } from '../automations/service'
 import { RuntimeBrowserCommands } from './orca-runtime-browser'
 import { RemoteRuntimeTerminalCreateIdempotency } from './remote-runtime-terminal-create-idempotency'
@@ -2775,6 +2778,7 @@ export class OrcaRuntimeService {
   private readonly runtimeId = randomUUID()
   private readonly startedAt = Date.now()
   private readonly store: RuntimeStore | null
+  private readonly workspacePortTunnelGrantStore = new WorkspacePortTunnelGrantStore()
   private managedHookReconciliationGeneration = 0
   private managedHookReconciliationTail: Promise<void> = Promise.resolve()
   private readonly orchestrationEnvironmentTransport: OrchestrationEnvironmentTransport | null
@@ -4759,6 +4763,10 @@ export class OrcaRuntimeService {
     return this.runtimeId
   }
 
+  getWorkspacePortTunnelGrantStore(): WorkspacePortTunnelGrantStore {
+    return this.workspacePortTunnelGrantStore
+  }
+
   resolveOrchestrationWorkerServer(selector: string): OrchestrationWorkerServer {
     if (!this.orchestrationEnvironmentTransport) {
       throw new OrchestrationError(
@@ -5089,7 +5097,9 @@ export class OrcaRuntimeService {
         (process.env.ORCA_E2E_DISABLE_RUNTIME_SHARED_CONTROL !== '1' ||
           capability !== REMOTE_RUNTIME_SHARED_CONTROL_CAPABILITY) &&
         (process.env.ORCA_E2E_DISABLE_PAIRED_TERMINAL_PARKING !== '1' ||
-          capability !== TERMINAL_PAIRED_PARKING_RUNTIME_CAPABILITY)
+          capability !== TERMINAL_PAIRED_PARKING_RUNTIME_CAPABILITY) &&
+        (process.env.ORCA_RUNTIME_PORT_TUNNEL !== '0' ||
+          capability !== WORKSPACE_PORT_TUNNEL_RUNTIME_CAPABILITY)
     )
     if (hasOffscreen) {
       capabilities.push(BROWSER_HEADLESS_RUNTIME_CAPABILITY)
@@ -13731,6 +13741,7 @@ export class OrcaRuntimeService {
   onClientDisconnected(clientId: string): void {
     this.revokeTerminalFileGrantsForClient(clientId)
     this.cancelMobileDictationForClient(clientId)
+    this.workspacePortTunnelGrantStore.revokeForDevice(clientId)
 
     // (1) Cancel pending restore-debounce timers owned by this client.
     for (const [ptyId, entry] of this.pendingRestoreTimers) {
@@ -21640,8 +21651,11 @@ export class OrcaRuntimeService {
     return target.managedWorktree
   }
 
-  async scanWorkspacePorts(repoId?: string): Promise<WorkspacePortScanResult> {
-    return scanWorkspacePortProbes(await this.getWorkspacePortProbes(repoId))
+  async scanWorkspacePorts(
+    repoId?: string,
+    options?: WorkspacePortScanOptions
+  ): Promise<WorkspacePortScanResult> {
+    return scanWorkspacePortProbes(await this.getWorkspacePortProbes(repoId), options)
   }
 
   async killWorkspacePort(args: WorkspacePortKillRequest): Promise<WorkspacePortKillResult> {
@@ -29327,7 +29341,7 @@ export class OrcaRuntimeService {
     return worktreeId
   }
 
-  private async resolveWorktreeSelector(selector: string): Promise<ResolvedWorktree> {
+  async resolveWorktreeSelector(selector: string): Promise<ResolvedWorktree> {
     const explicitWorktreeId = this.getValidatedExplicitWorktreeIdSelector(selector)
     // Why only `id:`: every other selector kind is matched across the whole fleet, and their
     // `selector_ambiguous` contract is defined over all repos. Scoping those would silently pick a

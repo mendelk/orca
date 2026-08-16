@@ -1510,6 +1510,7 @@ export class OrcaRuntimeRpcServer {
     )
     // Why: before-quit fences relay input; direct auth can still refresh lastSeen while these transports close.
     this.deviceRegistry?.flushPendingLastSeen()
+    this.runtime.getWorkspacePortTunnelGrantStore().shutdown()
     const failedStop = stopResults.find((result) => result.status === 'rejected')
     if (failedStop?.status === 'rejected') {
       throw failedStop.reason
