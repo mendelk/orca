@@ -9,7 +9,7 @@ import {
 } from '../../../shared/mobile-e2ee-v2-contract'
 import { sealMobileE2EEV2Frame } from '../../../shared/mobile-e2ee-v2-framing'
 import type { DeviceRegistry } from '../device-registry'
-import { deriveSharedKey, encrypt, generateKeyPair } from './e2ee-crypto'
+import { decrypt, deriveSharedKey, encrypt, encryptBytes, generateKeyPair } from './e2ee-crypto'
 import { deriveMobileE2EEV2KeySchedule } from './mobile-e2ee-v2-key-schedule'
 import {
   MobileSocketWiring,
@@ -40,7 +40,7 @@ class FakeTransport implements MobileSocketTransport {
     this.closeHandler = handler
   }
 
-  receive(ws: FakeSocket, message: string): void {
+  receive(ws: FakeSocket, message: string | Uint8Array<ArrayBufferLike>): void {
     this.messageHandler?.(message, vi.fn(), ws as unknown as WebSocket)
   }
 
@@ -188,6 +188,66 @@ describe('MobileSocketWiring', () => {
     expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ ws }), false)
     expect(wiring.channelCount).toBe(0)
     expect(wiring.connectionCount).toBe(0)
+  })
+
+  it('consumes a runtime grant, echoes the tunnel channel, and isolates binary routing', () => {
+    const desktop = generateKeyPair()
+    const client = generateKeyPair()
+    const ws = new FakeSocket()
+    const transport = new FakeTransport()
+    const authorizeTunnel = vi.fn(() => true)
+    const onText = vi.fn()
+    const onBinary = vi.fn()
+    const onTunnelBinary = vi.fn()
+    const wiring = new MobileSocketWiring({
+      deviceRegistry: registryFor('device-1', 'valid-token', 'runtime'),
+      e2eeKeypair: {
+        publicKey: desktop.publicKey,
+        secretKey: desktop.secretKey,
+        publicKeyB64: Buffer.from(desktop.publicKey).toString('base64')
+      },
+      authorizeTunnel,
+      onText,
+      onBinary,
+      onTunnelBinary,
+      onClose: vi.fn()
+    })
+    wiring.attachTransport(transport)
+
+    transport.receive(
+      ws,
+      JSON.stringify({
+        type: 'e2ee_hello',
+        publicKeyB64: Buffer.from(client.publicKey).toString('base64')
+      })
+    )
+    const sharedKey = deriveSharedKey(client.secretKey, desktop.publicKey)
+    transport.receive(
+      ws,
+      encrypt(
+        JSON.stringify({
+          type: 'e2ee_auth',
+          deviceToken: 'valid-token',
+          channel: 'workspace-port-tunnel.v1',
+          tunnelGrantId: 'grant-1'
+        }),
+        sharedKey
+      )
+    )
+    transport.receive(ws, encryptBytes(new Uint8Array([1, 2, 3]), sharedKey))
+
+    expect(authorizeTunnel).toHaveBeenCalledWith('grant-1', 'valid-token')
+    expect(onTunnelBinary).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'workspace-port-tunnel.v1', tunnelGrantId: 'grant-1' }),
+      new Uint8Array([1, 2, 3])
+    )
+    expect(onText).not.toHaveBeenCalled()
+    expect(onBinary).not.toHaveBeenCalled()
+    const authenticated = decrypt(ws.sent[1] as string, sharedKey)
+    expect(authenticated && JSON.parse(authenticated)).toMatchObject({
+      type: 'e2ee_authenticated',
+      channel: 'workspace-port-tunnel.v1'
+    })
   })
 
   it('closes an unknown-token socket even when reporting the failure throws', () => {

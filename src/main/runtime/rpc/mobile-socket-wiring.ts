@@ -39,6 +39,8 @@ export type AuthenticatedMobileSocket = {
   device: E2EEAuthenticatedDevice
   clientCapabilities: readonly RuntimeCapability[]
   transport: MobileSocketTransportMetadata
+  channel: 'rpc' | 'workspace-port-tunnel.v1'
+  tunnelGrantId?: string
 }
 
 type MobileSocketWiringOptions = {
@@ -51,6 +53,8 @@ type MobileSocketWiringOptions = {
     sendBinary: (response: Uint8Array<ArrayBufferLike>) => boolean | void
   ) => void
   onBinary: (socket: AuthenticatedMobileSocket, bytes: Uint8Array<ArrayBufferLike>) => void
+  onTunnelBinary?: (socket: AuthenticatedMobileSocket, bytes: Uint8Array<ArrayBufferLike>) => void
+  authorizeTunnel?: (grantId: string, deviceToken: string) => boolean
   onClose: (socket: AuthenticatedMobileSocket | null, hasOtherConnections: boolean) => void
   onReady?: (socket: AuthenticatedMobileSocket) => void
   // Why: stale keys and missing registry entries both fail before RPC can explain the re-pair action.
@@ -70,6 +74,8 @@ export class MobileSocketWiring {
   private readonly e2eeKeypair: E2EEKeypair
   private readonly onText: MobileSocketWiringOptions['onText']
   private readonly onBinary: MobileSocketWiringOptions['onBinary']
+  private readonly onTunnelBinary: MobileSocketWiringOptions['onTunnelBinary']
+  private readonly authorizeTunnel: MobileSocketWiringOptions['authorizeTunnel']
   private readonly onClose: MobileSocketWiringOptions['onClose']
   private readonly onReady: MobileSocketWiringOptions['onReady']
   private readonly onUnpairedDeviceAuthFailure: MobileSocketWiringOptions['onUnpairedDeviceAuthFailure']
@@ -84,6 +90,8 @@ export class MobileSocketWiring {
     this.e2eeKeypair = options.e2eeKeypair
     this.onText = options.onText
     this.onBinary = options.onBinary
+    this.onTunnelBinary = options.onTunnelBinary
+    this.authorizeTunnel = options.authorizeTunnel
     this.onClose = options.onClose
     this.onReady = options.onReady
     this.onUnpairedDeviceAuthFailure = options.onUnpairedDeviceAuthFailure
@@ -160,19 +168,42 @@ export class MobileSocketWiring {
           }
           return toAuthenticatedDevice(device)
         },
-        onReady: (channel, device) => {
-          const socket = {
+        onReady: (channel, device, auth) => {
+          const requestedChannel = auth.channel ?? 'rpc'
+          if (requestedChannel === 'workspace-port-tunnel.v1') {
+            if (device.scope === 'mobile') {
+              return {
+                ok: false,
+                code: 4001,
+                reason: 'Mobile-scoped devices cannot authorize workspace port tunnels.'
+              }
+            }
+            if (!auth.tunnelGrantId) {
+              return { ok: false, code: 4001, reason: 'Missing tunnel grant ID.' }
+            }
+            if (
+              !this.authorizeTunnel ||
+              !this.authorizeTunnel(auth.tunnelGrantId, device.deviceToken)
+            ) {
+              return { ok: false, code: 4001, reason: 'Invalid or expired tunnel grant.' }
+            }
+          }
+
+          const socket: AuthenticatedMobileSocket = {
             ws,
             connectionId,
             device,
             clientCapabilities: channel.clientCapabilities,
-            transport: metadata
+            transport: metadata,
+            channel: requestedChannel,
+            tunnelGrantId: auth.tunnelGrantId
           }
           this.authenticatedSockets.set(ws, socket)
           transport.setClientId(ws, device.deviceToken)
           // Why: deferred — the client's e2ee_authenticated must not wait on a secure-file rewrite.
           this.deviceRegistry.updateLastSeenDeferred(device.deviceId)
           this.onReady?.(socket)
+          return undefined
         },
         onError: (code, reason) => {
           const reportUnpairedDevice = code === 4001 && reason === 'Unauthorized'
@@ -191,14 +222,18 @@ export class MobileSocketWiring {
       })
       channel.onMessage((plaintext, reply, sendBinary) => {
         const socket = this.authenticatedSockets.get(ws)
-        if (socket) {
+        if (socket && socket.channel !== 'workspace-port-tunnel.v1') {
           this.onText(socket, plaintext, reply, sendBinary)
         }
       })
       channel.onBinaryMessage((bytes) => {
         const socket = this.authenticatedSockets.get(ws)
         if (socket) {
-          this.onBinary(socket, bytes)
+          if (socket.channel === 'workspace-port-tunnel.v1') {
+            this.onTunnelBinary?.(socket, bytes)
+          } else {
+            this.onBinary(socket, bytes)
+          }
         }
       })
       this.channels.set(ws, channel)

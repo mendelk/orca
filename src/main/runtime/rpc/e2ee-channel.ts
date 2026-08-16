@@ -7,40 +7,30 @@ import {
 } from './mobile-e2ee-v2-desktop-session'
 import type { DesktopMobileE2EEV2OutboundItem as V2OutboundItem } from './mobile-e2ee-v2-desktop-outbound'
 import { handleDesktopMobileE2EEV2Inbound } from './mobile-e2ee-v2-desktop-inbound'
-import { authenticateMobileE2EE, decodeMobileE2EEPublicKey } from './mobile-e2ee-auth-validation'
+import {
+  authenticateMobileE2EE,
+  decodeMobileE2EEPublicKey,
+  type MobileE2EEAuth
+} from './mobile-e2ee-auth-validation'
 import {
   isMobileE2EEBinaryPayloadWithinLimit,
   isMobileE2EEOutboundItemWithinLimit,
   isMobileE2EETextPayloadWithinLimit
 } from './mobile-e2ee-outbound-admission'
 import { parseRemoteRuntimeJsonText } from '../../../shared/remote-runtime-request-frames'
-import type { MobileE2EEOutboundMemoryBudget } from './mobile-e2ee-outbound-memory-budget'
 import { MobileE2EEDesktopOutboundOwner } from './mobile-e2ee-desktop-outbound-owner'
 import { parseRuntimeClientCapabilities } from './runtime-client-capabilities'
 import type { RuntimeCapability } from '../../../shared/protocol-version'
 import type { EventProps } from '../../../shared/telemetry-events'
 import { track } from '../../telemetry/client'
+import type { E2EEAuthenticatedDevice, E2EEChannelOptions } from './e2ee-channel-contract'
+
+export type { E2EEAuthenticatedDevice, E2EEChannelOptions } from './e2ee-channel-contract'
 
 type OutboundBudgetEmitter = EventProps<'remote_outbound_budget_close'>['emitter']
 
 const HANDSHAKE_TIMEOUT_MS = 10_000
 const MAX_CONSECUTIVE_DECRYPT_FAILURES = 5
-
-export type E2EEChannelOptions = {
-  serverSecretKey: Uint8Array
-  resolveAuthenticatedDevice: (token: string) => E2EEAuthenticatedDevice | null
-  onReady: (channel: E2EEChannel, device: E2EEAuthenticatedDevice) => void
-  onError: (code: number, reason: string) => void
-  transportContext?: DesktopMobileE2EEV2Context
-  requireV2?: boolean
-  outboundMemoryBudget?: MobileE2EEOutboundMemoryBudget
-}
-
-export type E2EEAuthenticatedDevice = {
-  deviceId: string
-  deviceToken: string
-  scope: 'mobile' | 'runtime'
-}
 
 export class E2EEChannel {
   private state: 'awaiting_hello' | 'awaiting_auth' | 'ready' = 'awaiting_hello'
@@ -50,7 +40,11 @@ export class E2EEChannel {
   private readonly ws: WebSocket
   private readonly serverSecretKey: Uint8Array
   private readonly resolveAuthenticatedDevice: (token: string) => E2EEAuthenticatedDevice | null
-  private readonly onReady: (channel: E2EEChannel, device: E2EEAuthenticatedDevice) => void
+  private readonly onReady: (
+    channel: E2EEChannel,
+    device: E2EEAuthenticatedDevice,
+    auth: MobileE2EEAuth
+  ) => void | { ok: false; code: number; reason: string }
   private readonly onError: (code: number, reason: string) => void
   private readonly transportContext: DesktopMobileE2EEV2Context
   private readonly requireV2: boolean
@@ -202,9 +196,9 @@ export class E2EEChannel {
         expectedContext: this.transportContext
       })
       if (!session) {
-        this.onError(4001, 'Invalid e2ee_hello v2')
-        return
+        return this.onError(4001, 'Invalid e2ee_hello v2')
       }
+
       this.v2Session = session
       this.state = 'awaiting_auth'
       if (this.ws.readyState === this.ws.OPEN) {
@@ -214,20 +208,17 @@ export class E2EEChannel {
     }
 
     if (this.requireV2) {
-      this.onError(4001, 'E2EE v2 required')
-      return
+      return this.onError(4001, 'E2EE v2 required')
     }
     if (hello.type !== 'e2ee_hello' || typeof hello.publicKeyB64 !== 'string') {
-      this.onError(4001, 'Invalid e2ee_hello')
-      return
+      return this.onError(4001, 'Invalid e2ee_hello')
     }
 
     // Why: derive the shared key from our secret + client's public key.
     // Both sides compute the same shared secret via ECDH.
     const clientPublicKey = decodeMobileE2EEPublicKey(hello.publicKeyB64)
     if (!clientPublicKey) {
-      this.onError(4001, 'Invalid public key')
-      return
+      return this.onError(4001, 'Invalid public key')
     }
 
     this.sharedKey = deriveSharedKey(this.serverSecretKey, clientPublicKey)
@@ -266,16 +257,18 @@ export class E2EEChannel {
     // Why: transport-bound identity checks must complete before the peer sees
     // authentication success; relay sockets additionally bind this context to
     // their immutable relayDeviceId in the resolver.
-    this.onReady(this, authenticatedDevice)
-    this.sendEncryptedControl(
-      this.v2Session
-        ? {
-            type: 'e2ee_authenticated',
-            v: 2,
-            transcriptHashB64: this.v2Session.transcriptHashB64
-          }
-        : { type: 'e2ee_authenticated' }
-    )
+    const readyResult = this.onReady(this, authenticatedDevice, authentication.auth)
+    if (readyResult && !readyResult.ok) {
+      this.sendEncryptedControl({ type: 'e2ee_error', error: { code: 'unauthorized' } })
+      return this.onError(readyResult.code, readyResult.reason)
+    }
+
+    const channel = authentication.auth.channel
+    this.sendEncryptedControl({
+      type: 'e2ee_authenticated',
+      ...(this.v2Session ? { v: 2, transcriptHashB64: this.v2Session.transcriptHashB64 } : {}),
+      ...(channel ? { channel } : {})
+    })
   }
 
   private handleV2RawMessage(raw: string | Uint8Array<ArrayBufferLike>): void {

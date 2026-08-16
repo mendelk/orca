@@ -116,7 +116,8 @@ function openServerFrame(
 
 function authenticate(
   ctx: ReturnType<typeof setup>,
-  schedule: ReturnType<typeof startV2>['schedule']
+  schedule: ReturnType<typeof startV2>['schedule'],
+  fields: Record<string, unknown> = {}
 ) {
   const transcriptHashB64 = Buffer.from(schedule.transcriptHash).toString('base64')
   ctx.channel.handleRawMessage(
@@ -125,7 +126,8 @@ function authenticate(
         type: 'e2ee_auth',
         v: 2,
         transcriptHashB64,
-        deviceToken: 'valid-token'
+        deviceToken: 'valid-token',
+        ...fields
       }),
       schedule,
       0n
@@ -143,16 +145,43 @@ describe('E2EEChannel v2', () => {
     authenticate(ctx, schedule)
 
     expect(ctx.resolveAuthenticatedDevice).toHaveBeenCalledOnce()
-    expect(ctx.onReady).toHaveBeenCalledWith(ctx.channel, {
-      deviceId: 'device-1',
-      deviceToken: 'valid-token',
-      scope: 'mobile'
-    })
+    expect(ctx.onReady).toHaveBeenCalledWith(
+      ctx.channel,
+      {
+        deviceId: 'device-1',
+        deviceToken: 'valid-token',
+        scope: 'mobile'
+      },
+      expect.anything()
+    )
     const authenticated = openServerFrame(ctx.ws.sent[1]!.data, 'text', schedule, 0n)
     expect(JSON.parse(new TextDecoder().decode(authenticated!))).toEqual({
       type: 'e2ee_authenticated',
       v: 2,
       transcriptHashB64: Buffer.from(schedule.transcriptHash).toString('base64')
+    })
+  })
+
+  it('authenticates and echoes a tunnel channel over relay v2 framing', () => {
+    const ctx = setup()
+    const { schedule } = startV2(ctx)
+    authenticate(ctx, schedule, {
+      channel: 'workspace-port-tunnel.v1',
+      tunnelGrantId: 'grant-1'
+    })
+
+    expect(ctx.onReady).toHaveBeenCalledWith(
+      ctx.channel,
+      expect.anything(),
+      expect.objectContaining({
+        channel: 'workspace-port-tunnel.v1',
+        tunnelGrantId: 'grant-1'
+      })
+    )
+    const authenticated = openServerFrame(ctx.ws.sent[1]!.data, 'text', schedule, 0n)
+    expect(JSON.parse(new TextDecoder().decode(authenticated!))).toMatchObject({
+      type: 'e2ee_authenticated',
+      channel: 'workspace-port-tunnel.v1'
     })
   })
 

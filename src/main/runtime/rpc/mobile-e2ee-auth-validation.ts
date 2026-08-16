@@ -8,6 +8,8 @@ export type MobileE2EEAuth = {
   clientCapabilities?: unknown
   v?: 2
   transcriptHashB64?: string
+  channel?: 'rpc' | 'workspace-port-tunnel.v1'
+  tunnelGrantId?: string
 }
 
 export function isValidMobileE2EEAuthVersion(
@@ -18,8 +20,12 @@ export function isValidMobileE2EEAuthVersion(
     return auth.v === undefined && auth.transcriptHashB64 === undefined
   }
   // Why: mobile v2 keeps an exact transcript-bound shape; runtime capabilities use legacy paired-runtime auth.
+  const keys = Object.keys(auth)
+    .filter((k) => k !== 'channel' && k !== 'tunnelGrantId')
+    .sort()
+    .join(',')
   return (
-    Object.keys(auth).sort().join(',') === 'deviceToken,transcriptHashB64,type,v' &&
+    keys === 'deviceToken,transcriptHashB64,type,v' &&
     auth.v === 2 &&
     auth.transcriptHashB64 === v2Session.transcriptHashB64
   )
@@ -41,7 +47,8 @@ export function authenticateMobileE2EE<TDevice extends { deviceToken: string }>(
   if (
     auth.type !== 'e2ee_auth' ||
     !auth.deviceToken ||
-    !isValidMobileE2EEAuthVersion(auth, args.v2Session)
+    !isValidMobileE2EEAuthVersion(auth, args.v2Session) ||
+    !isValidRequestedChannel(auth)
   ) {
     return { ok: false, code: 'bad_auth' }
   }
@@ -49,6 +56,18 @@ export function authenticateMobileE2EE<TDevice extends { deviceToken: string }>(
   return device?.deviceToken === auth.deviceToken
     ? { ok: true, device, auth }
     : { ok: false, code: 'unauthorized' }
+}
+
+function isValidRequestedChannel(auth: MobileE2EEAuth): boolean {
+  if (auth.channel === undefined || auth.channel === 'rpc') {
+    return auth.tunnelGrantId === undefined
+  }
+  return (
+    auth.channel === 'workspace-port-tunnel.v1' &&
+    typeof auth.tunnelGrantId === 'string' &&
+    auth.tunnelGrantId.length > 0 &&
+    auth.tunnelGrantId.length <= 256
+  )
 }
 
 export function decodeMobileE2EEPublicKey(value: string): Uint8Array | null {

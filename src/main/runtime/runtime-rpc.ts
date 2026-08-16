@@ -1311,6 +1311,14 @@ export class OrcaRuntimeRpcServer {
     const mobileSocketWiring = new MobileSocketWiring({
       deviceRegistry,
       e2eeKeypair,
+      authorizeTunnel: (grantId, deviceToken) => {
+        const result = this.runtime.getWorkspacePortTunnelGrantStore().consume({
+          grantId,
+          deviceToken,
+          runtimeInstanceId: this.runtime.getRuntimeId()
+        })
+        return result.ok
+      },
       onText: (socket, plaintext, reply, sendBinary) => {
         void this.handleWebSocketMessage(
           plaintext,

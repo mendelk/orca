@@ -72,11 +72,15 @@ describe('E2EEChannel', () => {
       const ctx = setup()
       doHandshake(ctx)
 
-      expect(ctx.onReady).toHaveBeenCalledWith(ctx.channel, {
-        deviceId: 'device-1',
-        deviceToken: 'valid-token',
-        scope: 'mobile'
-      })
+      expect(ctx.onReady).toHaveBeenCalledWith(
+        ctx.channel,
+        {
+          deviceId: 'device-1',
+          deviceToken: 'valid-token',
+          scope: 'mobile'
+        },
+        expect.anything()
+      )
       expect(ctx.onError).not.toHaveBeenCalled()
       expect(ctx.channel.deviceToken).toBe('valid-token')
 
