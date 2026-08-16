@@ -96,6 +96,14 @@ export const WORKTREE_VISIBILITY_DEFAULTS_RUNTIME_CAPABILITY =
   'worktree.visibility-defaults.v1' as const
 export const WORKTREE_VISIBILITY_SOURCE_DEFAULTS_RUNTIME_CAPABILITY =
   'worktree.visibility-source-defaults.v1' as const
+// Why: paired-runtime direct browser rendering tunnels raw TCP from loopback
+// listeners on the desktop client to workspace-attributed listeners on a paired
+// runtime. Capability-gated so an old client ignores it and an old runtime does
+// not advertise it; both skew directions keep the existing screencast behavior.
+// This is a separate negotiated binary channel, not a terminal stream opcode, so
+// it does not bump RUNTIME_PROTOCOL_VERSION. See
+// docs/superpowers/specs/2026-08-15-paired-runtime-direct-browser-design.md.
+export const WORKSPACE_PORT_TUNNEL_RUNTIME_CAPABILITY = 'workspace-port-tunnel.v1' as const
 
 export const RUNTIME_CAPABILITIES = [
   'runtime.status.compat.v1',
@@ -133,6 +141,7 @@ export const RUNTIME_CAPABILITIES = [
   FILE_MUTATION_OWNERSHIP_RUNTIME_CAPABILITY,
   WORKTREE_VISIBILITY_DEFAULTS_RUNTIME_CAPABILITY,
   WORKTREE_VISIBILITY_SOURCE_DEFAULTS_RUNTIME_CAPABILITY,
+  WORKSPACE_PORT_TUNNEL_RUNTIME_CAPABILITY,
   ACCOUNT_IMPORT_RUNTIME_CAPABILITY,
   CODEX_RESET_CREDIT_RUNTIME_CAPABILITY
 ] as const
