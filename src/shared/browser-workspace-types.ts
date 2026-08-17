@@ -52,6 +52,19 @@ export type BrowserViewportOverride = {
   mobile: boolean
 }
 
+/** Persisted intent for a client-owned browser page that reaches a paired
+ *  runtime listener through a Stage 1 workspace port tunnel. Records only
+ *  what is required to reacquire reachability after restore — never lease IDs,
+ *  grant IDs, local socket addresses, or live connection state. The descriptor
+ *  is the source of truth for fallback URL translation and for identifying
+ *  restore pages that must reacquire before the webview navigates. */
+export type BrowserPortTunnelDescriptor = {
+  environmentId: string
+  worktreeId: string
+  remoteOrigin: string
+  remotePort: number
+}
+
 export type BrowserPage = {
   id: string
   workspaceId: string
@@ -69,6 +82,14 @@ export type BrowserPage = {
   browserRuntimeEnvironmentId?: string | null
   /** Active CDP viewport emulation preset. null = default (fill pane, no CDP override) */
   viewportPresetId?: BrowserViewportPresetId | null
+  // Why: optional so sessions persisted before Stage 2 tunnel descriptors
+  // were added still validate; old clients strip it and old sessions stay
+  // undefined. Present on client-owned pages (browserRuntimeEnvironmentId
+  // is null) whose reachability comes from a paired runtime tunnel, AND
+  // retained on host-owned fallback pages for explicit retry — the restore
+  // gate checks ownership before reacquiring, so a retained descriptor on a
+  // host-owned page is inert.
+  portTunnelDescriptor?: BrowserPortTunnelDescriptor
 }
 
 export type BrowserWorkspace = {

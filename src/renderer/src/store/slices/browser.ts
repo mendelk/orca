@@ -8,6 +8,7 @@ import type {
   BrowserHistoryEntry,
   BrowserLoadError,
   BrowserPage,
+  BrowserPortTunnelDescriptor,
   BrowserSessionProfile,
   BrowserSessionProfileCreateOptions,
   BrowserViewportPresetId,
@@ -65,6 +66,7 @@ import {
   assertManagedBrowserMaterializationAllowed,
   getClientCreationActionPolicy
 } from '@/lib/client-creation-action-policy'
+import { validateBrowserPortTunnelDescriptor } from '../../../../shared/browser-port-tunnel-descriptor'
 
 type CreateBrowserTabOptions = {
   activate?: boolean
@@ -77,12 +79,18 @@ type CreateBrowserTabOptions = {
   // Explicit "New Tab" focuses the address bar even with a real home URL; link-opened tabs leave it unset.
   focusAddressBar?: boolean
   browserRuntimeEnvironmentId?: string | null
+  // Why: Stage 2 client-owned tunneled pages carry a descriptor so restore can
+  // reacquire before navigation and fallback can translate the local URL back
+  // to the remote origin. Valid with browserRuntimeEnvironmentId: null; also
+  // retained on host-owned fallback pages for explicit retry.
+  portTunnelDescriptor?: BrowserPortTunnelDescriptor
 }
 
 type CreateBrowserPageOptions = {
   activate?: boolean
   title?: string
   browserRuntimeEnvironmentId?: string | null
+  portTunnelDescriptor?: BrowserPortTunnelDescriptor
 }
 
 type BrowserTabPageState = {
@@ -392,9 +400,16 @@ function buildBrowserPage(
   url: string,
   title?: string,
   browserRuntimeEnvironmentId?: string | null,
-  browserPageId?: string
+  browserPageId?: string,
+  portTunnelDescriptor?: BrowserPortTunnelDescriptor
 ): BrowserPage {
   const normalizedUrl = normalizeUrl(url)
+  // Why: a descriptor is only meaningful on a client-owned page. Strip it
+  // silently when a caller pairs it with a non-null runtime id — the page
+  // is host-owned and the descriptor would mislead the restore gate. Also
+  // reject descriptors that fail strict validation so a corrupt persisted
+  // value cannot reach the store through this constructor.
+  const descriptor = sanitizePortTunnelDescriptor(portTunnelDescriptor, browserRuntimeEnvironmentId)
   return {
     id: browserPageId ?? createBrowserUuid(),
     workspaceId,
@@ -408,8 +423,30 @@ function buildBrowserPage(
     canGoForward: false,
     loadError: null,
     createdAt: Date.now(),
-    ...(browserRuntimeEnvironmentId !== undefined ? { browserRuntimeEnvironmentId } : {})
+    ...(browserRuntimeEnvironmentId !== undefined ? { browserRuntimeEnvironmentId } : {}),
+    ...(descriptor ? { portTunnelDescriptor: descriptor } : {})
   }
+}
+
+function sanitizePortTunnelDescriptor(
+  descriptor: BrowserPortTunnelDescriptor | undefined,
+  browserRuntimeEnvironmentId: string | null | undefined
+): BrowserPortTunnelDescriptor | undefined {
+  if (!descriptor) {
+    return undefined
+  }
+  // Why: a descriptor on a host-owned page is retained for explicit retry,
+  // but never used for tunnel reacquisition. Allow it through validation so
+  // the retry path keeps it; the restore gate ignores it for host-owned pages.
+  const validation = validateBrowserPortTunnelDescriptor(descriptor)
+  if (!validation.ok) {
+    return undefined
+  }
+  if (browserRuntimeEnvironmentId !== null && browserRuntimeEnvironmentId !== undefined) {
+    // Retain for retry even when host-owned; the restore gate checks ownership.
+    return validation.descriptor
+  }
+  return validation.descriptor
 }
 
 function buildWorkspaceFromPage(
@@ -615,7 +652,8 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
       url,
       options?.title,
       options?.browserRuntimeEnvironmentId,
-      browserPageId
+      browserPageId,
+      options?.portTunnelDescriptor
     )
     // Why: with no explicit profile, inherit the user's default so a Settings preference applies to new tabs.
     const sessionProfileId =
@@ -1019,14 +1057,18 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
       sessionProfileId,
       sessionPartition,
       targetGroupId: entryToRestore.position?.groupId,
-      browserRuntimeEnvironmentId: firstPage.browserRuntimeEnvironmentId
+      browserRuntimeEnvironmentId: firstPage.browserRuntimeEnvironmentId,
+      ...(firstPage.portTunnelDescriptor
+        ? { portTunnelDescriptor: firstPage.portTunnelDescriptor }
+        : {})
     })
 
     for (const p of restPages) {
       get().createBrowserPage(restored.id, p.url, {
         activate: false,
         title: p.title,
-        browserRuntimeEnvironmentId: p.browserRuntimeEnvironmentId
+        browserRuntimeEnvironmentId: p.browserRuntimeEnvironmentId,
+        ...(p.portTunnelDescriptor ? { portTunnelDescriptor: p.portTunnelDescriptor } : {})
       })
     }
 
@@ -1106,7 +1148,9 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
       workspace.worktreeId,
       url,
       options?.title,
-      options?.browserRuntimeEnvironmentId
+      options?.browserRuntimeEnvironmentId,
+      undefined,
+      options?.portTunnelDescriptor
     )
 
     set((s) => {
@@ -1288,7 +1332,10 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
     return get().createBrowserPage(workspaceId, pageToRestore.url, {
       title: pageToRestore.title,
       activate: true,
-      browserRuntimeEnvironmentId: pageToRestore.browserRuntimeEnvironmentId
+      browserRuntimeEnvironmentId: pageToRestore.browserRuntimeEnvironmentId,
+      ...(pageToRestore.portTunnelDescriptor
+        ? { portTunnelDescriptor: pageToRestore.portTunnelDescriptor }
+        : {})
     })
   },
 

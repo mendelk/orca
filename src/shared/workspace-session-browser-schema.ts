@@ -4,8 +4,9 @@
  * session schema now declares everywhere. */
 import { z } from 'zod'
 import type { BrowserWorkspace } from './browser-workspace-types'
+import { browserPortTunnelDescriptorSchema } from './browser-port-tunnel-descriptor'
 import { normalizeBrowserHistoryEntries } from './workspace-session-browser-history'
-import { salvagingArray } from './zod-salvage'
+import { salvagingArray, salvagedOptional } from './zod-salvage'
 
 const browserLoadErrorSchema = z.object({
   code: z.number(),
@@ -67,7 +68,17 @@ export const browserPageSchema = z.object({
   // Why: optional+nullable so sessions persisted before viewport presets were
   // added still validate; without this, zod would strip the field during
   // restore and reset the user's chosen preset on every app restart.
-  viewportPresetId: browserViewportPresetIdSchema.nullable().optional()
+  viewportPresetId: browserViewportPresetIdSchema.nullable().optional(),
+  // Why: salvagedOptional so a corrupt or hostile descriptor is STRIPPED at
+  // the session-load boundary while the rest of the page survives — a bad
+  // optional descriptor must not fail the whole page and drop the user's tab.
+  // Old clients strip this when loading newer sessions; new clients keep it
+  // on client-owned pages (browserRuntimeEnvironmentId is null) and retain it
+  // for explicit retry when a page falls back to a host-owned remote handle.
+  // NOT nullable: the descriptor is either present (valid intent) or absent
+  // (stripped) — null carries no meaning and would let an old persisted null
+  // survive the optional check.
+  portTunnelDescriptor: salvagedOptional('portTunnelDescriptor', browserPortTunnelDescriptorSchema)
 })
 
 const browserHistoryEntrySchema = z.object({
