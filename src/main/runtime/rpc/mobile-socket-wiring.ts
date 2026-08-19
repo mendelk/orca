@@ -126,7 +126,7 @@ export class MobileSocketWiring {
       }
       if (ws.bufferedAmount === 0) {
         // Why: ws is drained — notify. If the E2EE budget still rejects, sendTunnelB...
-        channel.notifyWritable()
+        channel.writable.notify()
         return
       }
       this.scheduleTunnelWritableRecheck(ws, channel)
@@ -273,7 +273,7 @@ export class MobileSocketWiring {
         }
       })
       // Why: wire the E2EE channel's writable notification to the tunnel session s...
-      channel.onWritable(() => {
+      channel.writable.on(() => {
         const socket = this.authenticatedSockets.get(ws)
         if (socket && socket.channel === 'workspace-port-tunnel.v1') {
           this.onTunnelWritable?.(socket)

@@ -454,11 +454,11 @@ describe('E2EEChannel', () => {
       const ctx = setup()
       doHandshake(ctx)
       let writableCalls = 0
-      ctx.channel.onWritable(() => {
+      ctx.channel.writable.on(() => {
         writableCalls++
       })
       ctx.channel.destroy()
-      ctx.channel.notifyWritable()
+      ctx.channel.writable.notify()
       expect(writableCalls).toBe(0)
     })
   })

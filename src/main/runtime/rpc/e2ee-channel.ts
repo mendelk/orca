@@ -24,6 +24,7 @@ import type { EventProps } from '../../../shared/telemetry-events'
 import { track } from '../../telemetry/client'
 import type { E2EEAuthenticatedDevice, E2EEChannelOptions } from './e2ee-channel-contract'
 import { sendLegacyE2EEBinary } from './e2ee-channel-binary-send'
+import { E2EEWritableSignal } from './e2ee-writable-signal'
 
 export type { E2EEAuthenticatedDevice, E2EEChannelOptions } from './e2ee-channel-contract'
 
@@ -59,7 +60,7 @@ export class E2EEChannel {
       ) => void)
     | null = null
   private binaryMessageHandler: ((plaintext: Uint8Array<ArrayBufferLike>) => void) | null = null
-  private writableHandler: (() => void) | null = null
+  readonly writable = new E2EEWritableSignal()
 
   deviceToken: string | null = null
   authenticatedDevice: E2EEAuthenticatedDevice | null = null
@@ -102,13 +103,6 @@ export class E2EEChannel {
       return this.enqueueV2({ kind: 'binary', plaintext })
     }
     return this.sendLegacyBinary(plaintext)
-  }
-
-  notifyWritable(): void {
-    this.writableHandler?.()
-  }
-  onWritable(handler: () => void): void {
-    this.writableHandler = handler
   }
 
   private sendLegacyBinary(response: Uint8Array<ArrayBufferLike>): boolean {
@@ -340,7 +334,7 @@ export class E2EEChannel {
     this.v2Session = null
     this.messageHandler = null
     this.binaryMessageHandler = null
-    this.writableHandler = null
+    this.writable.clear()
     this.outbound.dispose()
   }
 }
