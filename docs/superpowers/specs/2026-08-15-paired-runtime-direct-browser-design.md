@@ -4,6 +4,8 @@ Status: proposed design for implementation.
 
 Last updated: 2026-08-15.
 
+Implementation handoff: [2026-08-19 paired-runtime direct browser handoff](./2026-08-19-paired-runtime-direct-browser-handoff.md).
+
 ## Decision summary
 
 Orca will render eligible development servers from a paired remote runtime in a client-owned Electron `<webview>` instead of a host-owned screencast.
