@@ -409,7 +409,9 @@ describe('OrcaRuntimeRpcServer', () => {
       getStatus: () => ({ graphStatus: 'unavailable' }),
       cleanupSubscriptionsForConnection: () => {},
       cancelMobileDictationForConnection: () => {},
-      onClientDisconnected: () => {}
+      onClientDisconnected: () => {},
+      // Why: required by OrcaRuntimeRpcServer.stop() which cleans up the store on shutdown.
+      getWorkspacePortTunnelGrantStore: () => ({ shutdown: () => {} })
     } as unknown as OrcaRuntimeService
     expect(
       (runtimeProxy as { activateRecentPtyPathCandidateTracking?: unknown })

@@ -43,6 +43,8 @@ describe('remote runtime request connection integration', () => {
         cleanupSubscriptionsForConnection: () => {},
         cancelMobileDictationForConnection: () => {},
         onClientDisconnected: () => {},
+        // Why: required by OrcaRuntimeRpcServer.stop() which cleans up the store on shutdown.
+        getWorkspacePortTunnelGrantStore: () => ({ shutdown: () => {} }),
         refuseUnattributedMobileSessionTabClose,
         closeMobileSessionTab
       } as unknown as OrcaRuntimeService
@@ -115,6 +117,8 @@ describe('remote runtime request connection integration', () => {
         cleanupSubscriptionsForConnection: () => {},
         cancelMobileDictationForConnection: () => {},
         onClientDisconnected: () => {},
+        // Why: required by OrcaRuntimeRpcServer.stop() which cleans up the store on shutdown.
+        getWorkspacePortTunnelGrantStore: () => ({ shutdown: () => {} }),
         listRepos: () => repos
       } as unknown as OrcaRuntimeService
       const server = new OrcaRuntimeRpcServer({
@@ -200,6 +204,8 @@ describe('remote runtime request connection integration', () => {
         },
         cancelMobileDictationForConnection: () => {},
         onClientDisconnected: () => {},
+        // Why: required by OrcaRuntimeRpcServer.stop() which cleans up the store on shutdown.
+        getWorkspacePortTunnelGrantStore: () => ({ shutdown: () => {} }),
         showRepo: (selector: string) => {
           if (selector !== repo.id && selector !== `id:${repo.id}`) {
             throw new Error('repo_not_found')
@@ -365,6 +371,8 @@ describe('remote runtime request connection integration', () => {
         },
         cancelMobileDictationForConnection: () => {},
         onClientDisconnected: () => {},
+        // Why: required by OrcaRuntimeRpcServer.stop() which cleans up the store on shutdown.
+        getWorkspacePortTunnelGrantStore: () => ({ shutdown: () => {} }),
         onClientEvent: (listener: (event: RuntimeClientEvent) => void) => {
           clientEventListeners.add(listener)
           return () => clientEventListeners.delete(listener)
@@ -608,6 +616,8 @@ describe('remote runtime request connection integration', () => {
         },
         cancelMobileDictationForConnection: () => {},
         onClientDisconnected: () => {},
+        // Why: required by OrcaRuntimeRpcServer.stop() which cleans up the store on shutdown.
+        getWorkspacePortTunnelGrantStore: () => ({ shutdown: () => {} }),
         onClientEvent: (listener: (event: RuntimeClientEvent) => void) => {
           clientEventListeners.add(listener)
           return () => clientEventListeners.delete(listener)
