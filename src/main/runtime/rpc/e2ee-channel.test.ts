@@ -446,5 +446,20 @@ describe('E2EEChannel', () => {
       expect(callLateEmit).not.toThrow()
       expect(ctx.ws.sent.length).toBe(sentBefore)
     })
+
+    // Why: destroy() must clear writableHandler so a late notifyWritable
+    // (e.g. from a stale recheck timer) does not fire into a freed tunnel
+    // session, which would drain/re-pump a destroyed channel.
+    it('clears writableHandler so late notifyWritable is a no-op', () => {
+      const ctx = setup()
+      doHandshake(ctx)
+      let writableCalls = 0
+      ctx.channel.onWritable(() => {
+        writableCalls++
+      })
+      ctx.channel.destroy()
+      ctx.channel.notifyWritable()
+      expect(writableCalls).toBe(0)
+    })
   })
 })

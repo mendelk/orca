@@ -1,65 +1,21 @@
+import type {
+  MobileSocketTransportMetadata,
+  MobileSocketTransport,
+  AuthenticatedMobileSocket,
+  MobileSocketWiringOptions
+} from './mobile-socket-wiring-types'
+export type {
+  MobileSocketTransportMetadata,
+  MobileSocketTransport,
+  AuthenticatedMobileSocket,
+  MobileSocketWiringOptions
+} from './mobile-socket-wiring-types'
 import { randomBytes } from 'node:crypto'
 import type { WebSocket } from 'ws'
 import type { DeviceEntry, DeviceRegistry } from '../device-registry'
 import type { E2EEKeypair } from '../e2ee-keypair'
 import { E2EEChannel, type E2EEAuthenticatedDevice } from './e2ee-channel'
 import { createMobileE2EEOutboundMemoryBudget } from './mobile-e2ee-outbound-memory-budget'
-import type { RuntimeCapability } from '../../../shared/protocol-version'
-
-type MobileSocketPayload = string | Uint8Array<ArrayBufferLike>
-
-export type MobileSocketTransportMetadata =
-  | { transport: 'direct' }
-  | {
-      transport: 'relay'
-      relayHostId: string
-      relayDeviceId: string
-      basisConnId: string
-      credentialKind: 'invite' | 'resume'
-    }
-
-export type MobileSocketTransport = {
-  onMessage(
-    handler: (
-      message: MobileSocketPayload,
-      reply: (response: string) => void,
-      ws: WebSocket
-    ) => void
-  ): void
-  onConnectionClose(
-    handler: (clientId: string | null, ws: WebSocket, hasOtherConnections: boolean) => void
-  ): void
-  setClientId(ws: WebSocket, clientId: string): void
-  terminateClientConnections(clientId: string): number
-}
-
-export type AuthenticatedMobileSocket = {
-  ws: WebSocket
-  connectionId: string
-  device: E2EEAuthenticatedDevice
-  clientCapabilities: readonly RuntimeCapability[]
-  transport: MobileSocketTransportMetadata
-  channel: 'rpc' | 'workspace-port-tunnel.v1'
-  tunnelGrantId?: string
-}
-
-type MobileSocketWiringOptions = {
-  deviceRegistry: DeviceRegistry
-  e2eeKeypair: E2EEKeypair
-  onText: (
-    socket: AuthenticatedMobileSocket,
-    plaintext: string,
-    reply: (response: string) => void,
-    sendBinary: (response: Uint8Array<ArrayBufferLike>) => boolean | void
-  ) => void
-  onBinary: (socket: AuthenticatedMobileSocket, bytes: Uint8Array<ArrayBufferLike>) => void
-  onTunnelBinary?: (socket: AuthenticatedMobileSocket, bytes: Uint8Array<ArrayBufferLike>) => void
-  authorizeTunnel?: (grantId: string, deviceToken: string) => boolean
-  onClose: (socket: AuthenticatedMobileSocket | null, hasOtherConnections: boolean) => void
-  onReady?: (socket: AuthenticatedMobileSocket) => void
-  // Why: stale keys and missing registry entries both fail before RPC can explain the re-pair action.
-  onUnpairedDeviceAuthFailure?: (metadata: MobileSocketTransportMetadata) => void
-}
 
 function toAuthenticatedDevice(device: DeviceEntry): E2EEAuthenticatedDevice {
   return {
@@ -75,6 +31,7 @@ export class MobileSocketWiring {
   private readonly onText: MobileSocketWiringOptions['onText']
   private readonly onBinary: MobileSocketWiringOptions['onBinary']
   private readonly onTunnelBinary: MobileSocketWiringOptions['onTunnelBinary']
+  private readonly onTunnelWritable: MobileSocketWiringOptions['onTunnelWritable']
   private readonly authorizeTunnel: MobileSocketWiringOptions['authorizeTunnel']
   private readonly onClose: MobileSocketWiringOptions['onClose']
   private readonly onReady: MobileSocketWiringOptions['onReady']
@@ -84,6 +41,11 @@ export class MobileSocketWiring {
   private readonly authenticatedSockets = new Map<WebSocket, AuthenticatedMobileSocket>()
   private readonly transports = new Set<MobileSocketTransport>()
   private readonly outboundMemoryBudget = createMobileE2EEOutboundMemoryBudget()
+  // Why: bounded recheck timers for tunnel writable notification, keyed by ws.
+  private readonly writableRechecks = new Map<WebSocket, ReturnType<typeof setTimeout>>()
+  // Why: attempt counts per socket, persisted across recheck reschedules so a ...
+  private readonly writableRecheckAttempts = new Map<WebSocket, number>()
+  private static readonly WRITABLE_RECHECK_MAX_ATTEMPTS = 20
 
   constructor(options: MobileSocketWiringOptions) {
     this.deviceRegistry = options.deviceRegistry
@@ -91,6 +53,7 @@ export class MobileSocketWiring {
     this.onText = options.onText
     this.onBinary = options.onBinary
     this.onTunnelBinary = options.onTunnelBinary
+    this.onTunnelWritable = options.onTunnelWritable
     this.authorizeTunnel = options.authorizeTunnel
     this.onClose = options.onClose
     this.onReady = options.onReady
@@ -122,6 +85,72 @@ export class MobileSocketWiring {
     return this.connectionIds.get(ws)
   }
 
+  sendTunnelBinary(ws: WebSocket, plaintext: Uint8Array<ArrayBufferLike>): boolean {
+    const channel = this.channels.get(ws)
+    if (!channel) {
+      return false
+    }
+    const result = channel.sendBinary(plaintext)
+    if (result === false) {
+      this.scheduleTunnelWritableRecheck(ws, channel)
+    } else {
+      const recheck = this.writableRechecks.get(ws)
+      if (recheck) {
+        clearTimeout(recheck)
+        this.writableRechecks.delete(ws)
+      }
+      this.writableRecheckAttempts.delete(ws)
+    }
+    return result ?? false
+  }
+
+  // Why: the tunnel session closes the whole channel on invalid framing, unsup...
+  private scheduleTunnelWritableRecheck(ws: WebSocket, channel: E2EEChannel): void {
+    if (this.writableRechecks.has(ws)) {
+      return
+    }
+    const attempts = this.writableRecheckAttempts.get(ws) ?? 0
+    if (attempts >= MobileSocketWiring.WRITABLE_RECHECK_MAX_ATTEMPTS) {
+      this.closeTunnelChannel(ws, 4003, 'Tunnel transport remained backpressured.')
+      return
+    }
+    const nextAttempt = attempts + 1
+    this.writableRecheckAttempts.set(ws, nextAttempt)
+    // Why: bounded backoff: 50ms, 100ms, 200ms, 400ms, ... capped at 5s.
+    const delay = Math.min(50 * 2 ** attempts, 5000)
+    const poll = () => {
+      this.writableRechecks.delete(ws)
+      if (ws.readyState !== ws.OPEN) {
+        this.writableRecheckAttempts.delete(ws)
+        return
+      }
+      if (ws.bufferedAmount === 0) {
+        // Why: ws is drained — notify. If the E2EE budget still rejects, sendTunnelB...
+        channel.notifyWritable()
+        return
+      }
+      this.scheduleTunnelWritableRecheck(ws, channel)
+    }
+    this.writableRechecks.set(ws, setTimeout(poll, delay))
+  }
+
+  closeTunnelChannel(ws: WebSocket, code: number, reason: string): void {
+    const channel = this.channels.get(ws)
+    if (channel) {
+      channel.destroy()
+      this.channels.delete(ws)
+    }
+    const recheck = this.writableRechecks.get(ws)
+    if (recheck) {
+      clearTimeout(recheck)
+      this.writableRechecks.delete(ws)
+    }
+    this.writableRecheckAttempts.delete(ws)
+    if (ws.readyState === ws.OPEN) {
+      ws.close(code, reason)
+    }
+  }
+
   get channelCount(): number {
     return this.channels.size
   }
@@ -141,7 +170,7 @@ export class MobileSocketWiring {
   private handleRawMessage(
     transport: MobileSocketTransport,
     ws: WebSocket,
-    message: MobileSocketPayload,
+    message: string | Uint8Array<ArrayBufferLike>,
     metadata: MobileSocketTransportMetadata
   ): void {
     let channel = this.channels.get(ws)
@@ -161,8 +190,7 @@ export class MobileSocketWiring {
           if (!device) {
             return null
           }
-          // Why: outer relay authorization cannot choose the local Orca
-          // identity; E2EE must resolve the same device before readiness.
+          // Why: outer relay authorization cannot choose the local Orca identity; E2EE...
           if (metadata.transport === 'relay' && metadata.relayDeviceId !== device.deviceId) {
             return null
           }
@@ -170,6 +198,14 @@ export class MobileSocketWiring {
         },
         onReady: (channel, device, auth) => {
           const requestedChannel = auth.channel ?? 'rpc'
+          let tunnelEndpoints:
+            | readonly {
+                endpointId: number
+                port: number
+                connectHost: string
+                protocol: 'http' | 'https' | 'unknown'
+              }[]
+            | undefined
           if (requestedChannel === 'workspace-port-tunnel.v1') {
             if (device.scope === 'mobile') {
               return {
@@ -181,12 +217,11 @@ export class MobileSocketWiring {
             if (!auth.tunnelGrantId) {
               return { ok: false, code: 4001, reason: 'Missing tunnel grant ID.' }
             }
-            if (
-              !this.authorizeTunnel ||
-              !this.authorizeTunnel(auth.tunnelGrantId, device.deviceToken)
-            ) {
+            const grantedEndpoints = this.authorizeTunnel?.(auth.tunnelGrantId, device.deviceToken)
+            if (!grantedEndpoints) {
               return { ok: false, code: 4001, reason: 'Invalid or expired tunnel grant.' }
             }
+            tunnelEndpoints = grantedEndpoints
           }
 
           const socket: AuthenticatedMobileSocket = {
@@ -196,11 +231,12 @@ export class MobileSocketWiring {
             clientCapabilities: channel.clientCapabilities,
             transport: metadata,
             channel: requestedChannel,
-            tunnelGrantId: auth.tunnelGrantId
+            tunnelGrantId: auth.tunnelGrantId,
+            ...(tunnelEndpoints ? { tunnelEndpoints } : {})
           }
           this.authenticatedSockets.set(ws, socket)
           transport.setClientId(ws, device.deviceToken)
-          // Why: deferred — the client's e2ee_authenticated must not wait on a secure-file rewrite.
+          // Why: deferred — the client's e2ee_authenticated must not wait on a secure-...
           this.deviceRegistry.updateLastSeenDeferred(device.deviceId)
           this.onReady?.(socket)
           return undefined
@@ -214,7 +250,7 @@ export class MobileSocketWiring {
             try {
               this.onUnpairedDeviceAuthFailure?.(metadata)
             } catch (error) {
-              // Why: renderer teardown can make UI delivery throw; auth cleanup must remain authoritative.
+              // Why: renderer teardown can make UI delivery throw; auth cleanup must remai...
               console.error('[mobile] Failed to report unpaired-device auth failure:', error)
             }
           }
@@ -236,6 +272,13 @@ export class MobileSocketWiring {
           }
         }
       })
+      // Why: wire the E2EE channel's writable notification to the tunnel session s...
+      channel.onWritable(() => {
+        const socket = this.authenticatedSockets.get(ws)
+        if (socket && socket.channel === 'workspace-port-tunnel.v1') {
+          this.onTunnelWritable?.(socket)
+        }
+      })
       this.channels.set(ws, channel)
     }
     channel.handleRawMessage(message)
@@ -247,6 +290,12 @@ export class MobileSocketWiring {
     this.channels.get(ws)?.destroy()
     this.channels.delete(ws)
     this.connectionIds.delete(ws)
+    const recheck = this.writableRechecks.get(ws)
+    if (recheck) {
+      clearTimeout(recheck)
+      this.writableRechecks.delete(ws)
+    }
+    this.writableRecheckAttempts.delete(ws)
     const hasOtherConnections =
       socket !== null &&
       Array.from(this.authenticatedSockets.values()).some(

@@ -1,89 +1,46 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import {
   WORKSPACE_PORT_TUNNEL_GRANT_TTL_MS,
   WORKSPACE_PORT_TUNNEL_MAX_ENDPOINTS_PER_GRANT,
   WORKSPACE_PORT_TUNNEL_MAX_GRANTS_PER_RUNTIME,
   type WorkspacePortTunnelConsumeResult,
-  type WorkspacePortTunnelEndpointTarget,
   type WorkspacePortTunnelEndpointAccessResult,
   type WorkspacePortTunnelGrant,
   type WorkspacePortTunnelGrantedEndpoint,
-  type WorkspacePortTunnelGrantError,
-  type WorkspacePortTunnelResolvedWorkspace
+  type WorkspacePortTunnelGrantError
 } from '../../shared/workspace-port-tunnel'
+import {
+  constantTimeEqualHashes,
+  fail,
+  generateGrantId,
+  sha256,
+  type ConsumeArgs,
+  type EndpointAccessArgs,
+  type IssueArgs,
+  type StoredGrant,
+  WORKSPACE_PORT_TUNNEL_GRANT_ID_BYTES
+} from './workspace-port-tunnel-grant-store-types'
 
-// Why: the runtime grant store is the Stage 1 authorization core. It issues
-// cryptographically strong one-use grants bound to the authenticated device
-// token, runtime instance, and resolved workspace, each valid for at most 16
-// exact endpoints and expiring after 30 seconds when unattached. The store is
-// memory-only with fixed bounds and LRU cleanup; it never persists grants and
-// never trusts renderer-supplied paths or bind hosts. See
-// docs/superpowers/specs/2026-08-15-paired-runtime-direct-browser-design.md.
-
-export const WORKSPACE_PORT_TUNNEL_GRANT_ID_BYTES = 32
+export { WORKSPACE_PORT_TUNNEL_GRANT_ID_BYTES }
+export type {
+  DeviceScope,
+  IssueArgs,
+  ConsumeArgs,
+  EndpointAccessArgs,
+  StoredGrant
+} from './workspace-port-tunnel-grant-store-types'
+export type { WorkspacePortTunnelEndpointTarget } from '../../shared/workspace-port-tunnel'
 
 // Why: bound the stored grant map per runtime so a misbehaving or noisy client
 // cannot exhaust runtime memory. The spec caps active browser leases at 32 per
 // environment channel; unattached grants are short-lived and pruned on access.
 const MAX_STORED_GRANTS = WORKSPACE_PORT_TUNNEL_MAX_GRANTS_PER_RUNTIME
 
-type DeviceScope = 'mobile' | 'runtime'
-
-type StoredGrant = {
-  grant: WorkspacePortTunnelGrant
-  deviceTokenHash: Buffer
-  runtimeInstanceId: string
-  worktreeId: string
-  createdAt: number
-  consumed: boolean
-  consumedAt: number | null
-  revoked: boolean
-}
-
-type IssueArgs = {
-  deviceToken: string
-  deviceScope: DeviceScope
-  runtimeInstanceId: string
-  resolvedWorkspace: WorkspacePortTunnelResolvedWorkspace
-  endpoints: WorkspacePortTunnelEndpointTarget[]
-  now?: number
-}
-
-type ConsumeArgs = {
-  grantId: string
-  deviceToken: string
-  runtimeInstanceId: string
-  now?: number
-}
-
-type EndpointAccessArgs = {
-  grantId: string
-  endpointId: number
-  deviceToken: string
-  runtimeInstanceId: string
-  now?: number
-}
-
-function fail(error: WorkspacePortTunnelGrantError, message: string) {
-  return { ok: false as const, error, message }
-}
-
-function sha256(value: string): Buffer {
-  // Why: the store never stores or logs the raw device token. Hashing it with
-  // sha256 (no salt) is sufficient for equality checks because the token is a
-  // high-entropy secret already; we only need a constant-time comparison key.
-  return createHash('sha256').update(value).digest()
-}
-
-function constantTimeEqualHashes(a: Buffer, b: Buffer): boolean {
-  if (a.length !== b.length) {
-    return false
-  }
-  return timingSafeEqual(a, b)
-}
-
-function generateGrantId(): string {
-  return randomBytes(WORKSPACE_PORT_TUNNEL_GRANT_ID_BYTES).toString('base64url')
+// Why: a narrow revocation request — release the grants attached to a specific
+// channel (identified by the consumed grant ids the session installed) without
+// touching unrelated device grants. Used by tunnel-session close cleanup so a
+// closing channel does not revoke a parallel RPC connection's grants.
+export type ReleaseGrantsForChannelArgs = {
+  grantIds: readonly string[]
 }
 
 export class WorkspacePortTunnelGrantStore {
@@ -125,7 +82,6 @@ export class WorkspacePortTunnelGrantStore {
     ) {
       return fail('workspace_not_found', 'Resolved workspace does not match the runtime instance.')
     }
-
     const endpointKeys = new Set<string>()
     for (const endpoint of args.endpoints) {
       const key = `${endpoint.connectHost}\u0000${endpoint.port}`
@@ -134,7 +90,6 @@ export class WorkspacePortTunnelGrantStore {
       }
       endpointKeys.add(key)
     }
-
     const now = args.now ?? this.now()
     this.evictExpired(now)
     if (!this.makeRoomForGrant()) {
@@ -146,18 +101,15 @@ export class WorkspacePortTunnelGrantStore {
     const normalized: WorkspacePortTunnelGrantedEndpoint[] = args.endpoints.map((endpoint) => {
       return { ...endpoint, endpointId: this.allocateEndpointId() }
     })
-
     let grantId = generateGrantId()
     while (this.grants.has(grantId)) {
       grantId = generateGrantId()
     }
-    const expiresAt = now + WORKSPACE_PORT_TUNNEL_GRANT_TTL_MS
     const grant: WorkspacePortTunnelGrant = {
       grantId,
-      expiresAt,
+      expiresAt: now + WORKSPACE_PORT_TUNNEL_GRANT_TTL_MS,
       endpoints: normalized
     }
-
     this.grants.set(grantId, {
       grant,
       deviceTokenHash: sha256(args.deviceToken),
@@ -190,8 +142,6 @@ export class WorkspacePortTunnelGrantStore {
       return fail('runtime_mismatch', 'Grant was issued to a different runtime instance.')
     }
     if (stored.consumed) {
-      // Why: one-use. A second attach on a different channel cannot replay the
-      // same grant; the attached channel keeps its own authorization state.
       return fail('grant_already_consumed', 'Grant has already been consumed by a data channel.')
     }
     stored.consumed = true
@@ -206,7 +156,7 @@ export class WorkspacePortTunnelGrantStore {
       return fail('grant_not_found', 'Grant is unknown or has been revoked.')
     }
     // Why: an attached channel may remain alive past expiresAt; expiration
-    // limits replay, not a healthy session. So endpoint access checks the
+    // limits replay, not a healthy session. Endpoint access checks the
     // consumed flag, not expiry, once attached.
     if (!stored.consumed) {
       if (stored.grant.expiresAt <= now) {
@@ -239,6 +189,23 @@ export class WorkspacePortTunnelGrantStore {
     return true
   }
 
+  // Why: narrow channel close revocation. Releases only the grants the closing
+  // channel consumed (one or more AUTHORIZE frames on the same channel) without
+  // touching a parallel RPC connection's grants. Unknown ids are no-ops so a
+  // double-close is safe. Returns the number actually removed.
+  releaseGrantsForChannel(args: ReleaseGrantsForChannelArgs): number {
+    let removed = 0
+    for (const grantId of args.grantIds) {
+      if (this.grants.delete(grantId)) {
+        removed++
+      }
+    }
+    if (removed > 0) {
+      this.rebuildOrder()
+    }
+    return removed
+  }
+
   revokeForDevice(deviceToken: string): number {
     const hash = sha256(deviceToken)
     let removed = 0
@@ -254,9 +221,9 @@ export class WorkspacePortTunnelGrantStore {
 
   revokeForRuntime(runtimeInstanceId: string): number {
     let removed = 0
-    for (const [grantId, stored] of this.grants) {
+    for (const [, stored] of this.grants) {
       if (stored.runtimeInstanceId === runtimeInstanceId) {
-        this.grants.delete(grantId)
+        this.grants.delete(stored.grant.grantId)
         removed++
       }
     }
@@ -266,9 +233,9 @@ export class WorkspacePortTunnelGrantStore {
 
   revokeForWorkspace(runtimeInstanceId: string, worktreeId: string): number {
     let removed = 0
-    for (const [grantId, stored] of this.grants) {
+    for (const [, stored] of this.grants) {
       if (stored.runtimeInstanceId === runtimeInstanceId && stored.worktreeId === worktreeId) {
-        this.grants.delete(grantId)
+        this.grants.delete(stored.grant.grantId)
         removed++
       }
     }
@@ -296,7 +263,7 @@ export class WorkspacePortTunnelGrantStore {
   }
 
   // Why: expose whether a specific grant is currently consumed so tests and the
-  // future channel layer can assert one-use behavior without re-consuming.
+  // channel layer can assert one-use behavior without re-consuming.
   isConsumed(grantId: string): boolean {
     return this.grants.get(grantId)?.consumed ?? false
   }

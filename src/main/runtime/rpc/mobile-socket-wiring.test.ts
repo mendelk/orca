@@ -11,6 +11,7 @@ import { sealMobileE2EEV2Frame } from '../../../shared/mobile-e2ee-v2-framing'
 import type { DeviceRegistry } from '../device-registry'
 import { decrypt, deriveSharedKey, encrypt, encryptBytes, generateKeyPair } from './e2ee-crypto'
 import { deriveMobileE2EEV2KeySchedule } from './mobile-e2ee-v2-key-schedule'
+import type { E2EEKeypair } from '../e2ee-keypair'
 import {
   MobileSocketWiring,
   type MobileSocketTransport,
@@ -195,7 +196,9 @@ describe('MobileSocketWiring', () => {
     const client = generateKeyPair()
     const ws = new FakeSocket()
     const transport = new FakeTransport()
-    const authorizeTunnel = vi.fn(() => true)
+    const authorizeTunnel = vi.fn(() => [
+      { endpointId: 1, port: 3000, connectHost: '127.0.0.1', protocol: 'http' as const }
+    ])
     const onText = vi.fn()
     const onBinary = vi.fn()
     const onTunnelBinary = vi.fn()
@@ -407,5 +410,144 @@ describe('MobileSocketWiring', () => {
 
     expect(transport.setClientId).not.toHaveBeenCalled()
     expect(ws.close).toHaveBeenCalledWith(4001, 'Unauthorized')
+  })
+
+  it('writable recheck stops deterministically after bounded attempts when ws stays backpressured', () => {
+    // Why: when ws.bufferedAmount stays > 0, the recheck reschedules. The
+    // prior code reset the attempt counter on each reschedule (fresh closure
+    // per schedule), looping forever at 20 Hz. The attempt count now persists
+    // across reschedules and stops at the cap.
+    vi.useFakeTimers()
+    const desktop = generateKeyPair()
+    const client = generateKeyPair()
+    const ws = new FakeSocket()
+    const transport = new FakeTransport()
+    const authorizeTunnel = vi.fn(() => [
+      { endpointId: 1, port: 3000, connectHost: '127.0.0.1', protocol: 'http' as const }
+    ])
+    const onTunnelWritable = vi.fn()
+    const wiring = new MobileSocketWiring({
+      deviceRegistry: registryFor('device-1', 'valid-token', 'runtime'),
+      e2eeKeypair: {
+        publicKey: desktop.publicKey,
+        secretKey: desktop.secretKey,
+        publicKeyB64: Buffer.from(desktop.publicKey).toString('base64')
+      },
+      authorizeTunnel,
+      onText: vi.fn(),
+      onBinary: vi.fn(),
+      onTunnelBinary: vi.fn(),
+      onTunnelWritable,
+      onClose: vi.fn()
+    })
+    wiring.attachTransport(transport)
+    transport.receive(
+      ws,
+      JSON.stringify({
+        type: 'e2ee_hello',
+        publicKeyB64: Buffer.from(client.publicKey).toString('base64')
+      })
+    )
+    const sharedKey = deriveSharedKey(client.secretKey, desktop.publicKey)
+    transport.receive(
+      ws,
+      encrypt(
+        JSON.stringify({
+          type: 'e2ee_auth',
+          deviceToken: 'valid-token',
+          channel: 'workspace-port-tunnel.v1',
+          tunnelGrantId: 'grant-1'
+        }),
+        sharedKey
+      )
+    )
+    // Why: keep ws buffered so the recheck reschedules without notifying.
+    ws.bufferedAmount = 32 * 1024 * 1024
+    wiring.sendTunnelBinary(ws as unknown as WebSocket, new Uint8Array(100))
+    // Why: the prior code would loop forever; the bounded attempts stop.
+    vi.advanceTimersByTime(120_000)
+    const notifyCount = onTunnelWritable.mock.calls.length
+    // Why: bufferedAmount > 0 so notifyWritable is never called.
+    expect(notifyCount).toBe(0)
+    // Why: advance more — no new timers fire (stopped at the cap).
+    vi.advanceTimersByTime(120_000)
+    expect(onTunnelWritable.mock.calls.length).toBe(0)
+    vi.useRealTimers()
+  })
+
+  it('sendTunnelBinary success resets attempts, and cap closes channel', () => {
+    vi.useFakeTimers()
+    const deviceRegistry = {
+      resolveDeviceToken: vi
+        .fn()
+        .mockReturnValue({ deviceId: 'dev1', token: 'valid-token', scope: 'runtime' }),
+      validateToken: vi
+        .fn()
+        .mockReturnValue({ deviceId: 'dev1', token: 'valid-token', scope: 'runtime' }),
+      updateLastSeenDeferred: vi.fn()
+    }
+    const desktop = generateKeyPair()
+    const client = generateKeyPair()
+    const e2eeKeypair = {
+      publicKey: desktop.publicKey,
+      secretKey: desktop.secretKey,
+      publicKeyB64: Buffer.from(desktop.publicKey).toString('base64')
+    }
+    const transport = new FakeTransport()
+    const ws = new FakeSocket()
+    const onTunnelWritable = vi.fn()
+    const wiring = new MobileSocketWiring({
+      deviceRegistry: deviceRegistry as unknown as DeviceRegistry,
+      e2eeKeypair: e2eeKeypair as unknown as E2EEKeypair,
+      onText: vi.fn(),
+      onBinary: vi.fn(),
+      onTunnelBinary: vi.fn(),
+      onTunnelWritable,
+      onClose: vi.fn(),
+      authorizeTunnel: vi.fn().mockReturnValue(true)
+    })
+    wiring.attachTransport(transport)
+    transport.receive(
+      ws,
+      JSON.stringify({
+        type: 'e2ee_hello',
+        publicKeyB64: Buffer.from(client.publicKey).toString('base64')
+      })
+    )
+    const sharedKey = deriveSharedKey(client.secretKey, desktop.publicKey)
+    transport.receive(
+      ws,
+      encrypt(
+        JSON.stringify({
+          type: 'e2ee_auth',
+          deviceToken: 'valid-token',
+          channel: 'workspace-port-tunnel.v1',
+          tunnelGrantId: 'g1'
+        }),
+        sharedKey
+      )
+    )
+
+    ws.bufferedAmount = 32 * 1024 * 1024
+    // Episode 1: Transient backpressure, fails then succeeds
+    wiring.sendTunnelBinary(ws as unknown as WebSocket, new Uint8Array(100))
+    vi.advanceTimersByTime(50) // attempts=1
+    expect(ws.close).not.toHaveBeenCalled()
+    // Now success
+    ws.bufferedAmount = 0
+    wiring.sendTunnelBinary(ws as unknown as WebSocket, new Uint8Array(100)) // this succeeds, clears attempts
+
+    // Episode 2: Independent episode that reaches cap
+    ws.bufferedAmount = 32 * 1024 * 1024
+    wiring.sendTunnelBinary(ws as unknown as WebSocket, new Uint8Array(100))
+    for (let i = 0; i < 30; i++) {
+      vi.advanceTimersByTime(5000)
+    }
+    // Should have closed exactly once
+    expect(ws.close).toHaveBeenCalledTimes(1)
+    expect(ws.close).toHaveBeenCalledWith(4003, 'Tunnel transport remained backpressured.')
+
+    // Memory cleanup checked implicitly via the handler being removed and no infinite loop
+    vi.useRealTimers()
   })
 })

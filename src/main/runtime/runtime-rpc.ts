@@ -53,6 +53,8 @@ import {
   decodeTerminalStreamFrame,
   type TerminalStreamFrame
 } from '../../shared/terminal-stream-protocol'
+import { WorkspacePortTunnelSession } from '../runtime-port-tunnel/workspace-port-tunnel-session'
+import { createNodeNetSocketFactory } from '../runtime-port-tunnel/workspace-port-tunnel-session-sockets'
 
 const DEFAULT_WS_PORT = 6768
 
@@ -528,6 +530,9 @@ export class OrcaRuntimeRpcServer {
     string,
     Map<number, (frame: TerminalStreamFrame) => void>
   >()
+  // Why: one tunnel session per authenticated workspace-port-tunnel.v1 channel.
+  // Keyed by the underlying WebSocket so onClose can clean up deterministically.
+  private readonly tunnelSessions = new Map<WebSocket, WorkspacePortTunnelSession>()
   private readonly wsDispatchAbortStates = new Map<
     WebSocket,
     { controllers: Set<AbortController>; abortOnClose: () => void }
@@ -1038,6 +1043,36 @@ export class OrcaRuntimeRpcServer {
     this.binaryStreamHandlers.get(connectionId)?.get(frame.streamId)?.(frame)
   }
 
+  // Why: route encrypted binary frames from a workspace-port-tunnel.v1 channel
+  // to the per-channel session. The session is created at authenticated
+  // readiness (onReady) so grant release happens even with zero frames.
+  private handleTunnelBinary(
+    socket: AuthenticatedMobileSocket,
+    bytes: Uint8Array<ArrayBufferLike>
+  ): void {
+    const session = this.tunnelSessions.get(socket.ws)
+    if (session) {
+      session.handleBinaryFrame(bytes)
+    }
+  }
+
+  private createTunnelSession(socket: AuthenticatedMobileSocket): WorkspacePortTunnelSession {
+    const session = new WorkspacePortTunnelSession({
+      grantStore: this.runtime.getWorkspacePortTunnelGrantStore(),
+      deviceToken: socket.device.deviceToken,
+      runtimeInstanceId: this.runtime.getRuntimeId(),
+      socketFactory: createNodeNetSocketFactory(),
+      sendFrame: (plaintext) =>
+        this.mobileSocketWiring?.sendTunnelBinary(socket.ws, plaintext) ?? false,
+      closeChannel: (code, reason) =>
+        this.mobileSocketWiring?.closeTunnelChannel(socket.ws, code, reason),
+      initialEndpoints: socket.tunnelEndpoints,
+      initialGrantId: socket.tunnelGrantId
+    })
+    this.tunnelSessions.set(socket.ws, session)
+    return session
+  }
+
   private registerWebSocketDispatchAbort(ws: WebSocket): {
     signal: AbortSignal
     dispose: () => void
@@ -1317,7 +1352,18 @@ export class OrcaRuntimeRpcServer {
           deviceToken,
           runtimeInstanceId: this.runtime.getRuntimeId()
         })
-        return result.ok
+        if (!result.ok) {
+          return null
+        }
+        // Why: return the full server-internal endpoint descriptors so the
+        // session can resolve OPEN frames to real host/port targets. These
+        // never go to the client — the wiring carries them server-internal.
+        return result.grant.endpoints.map((e) => ({
+          endpointId: e.endpointId,
+          port: e.port,
+          connectHost: e.connectHost,
+          protocol: e.protocol
+        }))
       },
       onText: (socket, plaintext, reply, sendBinary) => {
         void this.handleWebSocketMessage(
@@ -1331,7 +1377,12 @@ export class OrcaRuntimeRpcServer {
         )
       },
       onBinary: (socket, bytes) => this.handleWebSocketBinaryMessage(bytes, socket.ws),
-      onReady: () => {
+      onTunnelBinary: (socket, bytes) => this.handleTunnelBinary(socket, bytes),
+      onTunnelWritable: (socket) => {
+        const session = this.tunnelSessions.get(socket.ws)
+        session?.notifyTransportWritable()
+      },
+      onReady: (socket) => {
         // Why: first authenticated mobile/remote client (direct WS and
         // cloud relay both attach here) starts path-candidate tracking.
         // Activation is a local-host concern: candidate buffers live on the
@@ -1339,6 +1390,14 @@ export class OrcaRuntimeRpcServer {
         // legitimately lack this method (its own server activates it).
         this.runtime.activateRecentPtyPathCandidateTracking?.()
         this.mobileRelayPairingProvider?.onDemandStateChanged?.()
+        // Why: create the tunnel session at authenticated readiness so an
+        // authenticated channel that sends zero binary frames still releases
+        // its consumed initial grant on close. Prior lazy creation only
+        // instantiated the session on the first binary frame, leaking the
+        // grant if the client closed without sending any data.
+        if (socket.channel === 'workspace-port-tunnel.v1' && !this.tunnelSessions.has(socket.ws)) {
+          this.createTunnelSession(socket)
+        }
       },
       onClose: (socket, hasOtherConnections) => {
         if (!socket) {
@@ -1349,6 +1408,14 @@ export class OrcaRuntimeRpcServer {
         this.runtime.cleanupSubscriptionsForConnection(socket.connectionId)
         this.runtime.cancelMobileDictationForConnection(socket.connectionId)
         this.binaryStreamHandlers.delete(socket.connectionId)
+        // Why: a tunnel channel close resets all active TCP sockets and
+        // releases the session's consumed grants narrowly (not all device
+        // grants). Reconnect requires a new grant and never replays streams.
+        const tunnelSession = this.tunnelSessions.get(socket.ws)
+        if (tunnelSession) {
+          tunnelSession.handleClose()
+          this.tunnelSessions.delete(socket.ws)
+        }
         if (!hasOtherConnections) {
           this.runtime.onClientDisconnected(socket.device.deviceToken)
         }

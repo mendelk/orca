@@ -59,6 +59,7 @@ export class E2EEChannel {
       ) => void)
     | null = null
   private binaryMessageHandler: ((plaintext: Uint8Array<ArrayBufferLike>) => void) | null = null
+  private writableHandler: (() => void) | null = null
 
   deviceToken: string | null = null
   authenticatedDevice: E2EEAuthenticatedDevice | null = null
@@ -91,6 +92,38 @@ export class E2EEChannel {
 
   onBinaryMessage(handler: (plaintext: Uint8Array<ArrayBufferLike>) => void): void {
     this.binaryMessageHandler = handler
+  }
+
+  sendBinary(plaintext: Uint8Array<ArrayBufferLike>): boolean | void {
+    if (this.state !== 'ready') {
+      return false
+    }
+    if (this.v2Session) {
+      return this.enqueueV2({ kind: 'binary', plaintext })
+    }
+    return this.sendLegacyBinary(plaintext)
+  }
+
+  notifyWritable(): void {
+    this.writableHandler?.()
+  }
+  onWritable(handler: () => void): void {
+    this.writableHandler = handler
+  }
+
+  private sendLegacyBinary(response: Uint8Array<ArrayBufferLike>): boolean {
+    if (!this.sharedKey || this.ws.readyState !== this.ws.OPEN) {
+      return false
+    }
+    if (!isMobileE2EEBinaryPayloadWithinLimit(response)) {
+      this.closeForOutboundBudget('size')
+      return false
+    }
+    if (!this.outbound.canSend(response.byteLength + 40)) {
+      return false
+    }
+    this.ws.send(Buffer.from(encryptBytes(response, this.sharedKey)), { binary: true })
+    return true
   }
 
   handleRawMessage(raw: string | Uint8Array<ArrayBufferLike>): void {
@@ -154,20 +187,8 @@ export class E2EEChannel {
         () => this.closeForOutboundBudget('queue')
       )
     }
-    const encryptedBinaryReply = (response: Uint8Array<ArrayBufferLike>): boolean => {
-      if (!this.sharedKey || this.ws.readyState !== this.ws.OPEN) {
-        return false
-      }
-      if (!isMobileE2EEBinaryPayloadWithinLimit(response)) {
-        this.closeForOutboundBudget('size')
-        return false
-      }
-      if (!this.outbound.canSend(response.byteLength + 40)) {
-        return false
-      }
-      this.ws.send(Buffer.from(encryptBytes(response, this.sharedKey)), { binary: true })
-      return true
-    }
+    const encryptedBinaryReply = (response: Uint8Array<ArrayBufferLike>): boolean =>
+      this.sendBinary(response) === true
     this.messageHandler?.(plaintext, encryptedReply, encryptedBinaryReply)
   }
 
@@ -331,6 +352,10 @@ export class E2EEChannel {
     this.v2Session = null
     this.messageHandler = null
     this.binaryMessageHandler = null
+    // Why: clear writableHandler so a late notifyWritable after destroy does
+    // not fire into a freed session, which would drain/re-pump a destroyed
+    // tunnel.
+    this.writableHandler = null
     this.outbound.dispose()
   }
 }
