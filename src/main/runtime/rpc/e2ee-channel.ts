@@ -1,6 +1,6 @@
 // Why: this channel keeps E2EE framing out of RPC handlers, which consume plaintext across transports.
 import type { WebSocket } from 'ws'
-import { deriveSharedKey, encrypt, decrypt, encryptBytes, decryptBytes } from './e2ee-crypto'
+import { deriveSharedKey, encrypt, decrypt, decryptBytes } from './e2ee-crypto'
 import {
   DesktopMobileE2EEV2Session,
   type DesktopMobileE2EEV2Context
@@ -13,7 +13,6 @@ import {
   type MobileE2EEAuth
 } from './mobile-e2ee-auth-validation'
 import {
-  isMobileE2EEBinaryPayloadWithinLimit,
   isMobileE2EEOutboundItemWithinLimit,
   isMobileE2EETextPayloadWithinLimit
 } from './mobile-e2ee-outbound-admission'
@@ -24,6 +23,7 @@ import type { RuntimeCapability } from '../../../shared/protocol-version'
 import type { EventProps } from '../../../shared/telemetry-events'
 import { track } from '../../telemetry/client'
 import type { E2EEAuthenticatedDevice, E2EEChannelOptions } from './e2ee-channel-contract'
+import { sendLegacyE2EEBinary } from './e2ee-channel-binary-send'
 
 export type { E2EEAuthenticatedDevice, E2EEChannelOptions } from './e2ee-channel-contract'
 
@@ -112,18 +112,13 @@ export class E2EEChannel {
   }
 
   private sendLegacyBinary(response: Uint8Array<ArrayBufferLike>): boolean {
-    if (!this.sharedKey || this.ws.readyState !== this.ws.OPEN) {
-      return false
-    }
-    if (!isMobileE2EEBinaryPayloadWithinLimit(response)) {
-      this.closeForOutboundBudget('size')
-      return false
-    }
-    if (!this.outbound.canSend(response.byteLength + 40)) {
-      return false
-    }
-    this.ws.send(Buffer.from(encryptBytes(response, this.sharedKey)), { binary: true })
-    return true
+    return sendLegacyE2EEBinary({
+      ws: this.ws,
+      sharedKey: this.sharedKey,
+      outbound: this.outbound,
+      response,
+      closeForSize: () => this.closeForOutboundBudget('size')
+    })
   }
 
   handleRawMessage(raw: string | Uint8Array<ArrayBufferLike>): void {
@@ -235,8 +230,6 @@ export class E2EEChannel {
       return this.onError(4001, 'Invalid e2ee_hello')
     }
 
-    // Why: derive the shared key from our secret + client's public key.
-    // Both sides compute the same shared secret via ECDH.
     const clientPublicKey = decodeMobileE2EEPublicKey(hello.publicKeyB64)
     if (!clientPublicKey) {
       return this.onError(4001, 'Invalid public key')
@@ -245,8 +238,6 @@ export class E2EEChannel {
     this.sharedKey = deriveSharedKey(this.serverSecretKey, clientPublicKey)
     this.state = 'awaiting_auth'
 
-    // Why: send e2ee_ready as plaintext — the client needs it to know the
-    // key exchange succeeded before it can send encrypted authentication.
     if (this.ws.readyState === this.ws.OPEN) {
       this.ws.send(JSON.stringify({ type: 'e2ee_ready' }))
     }
@@ -275,9 +266,6 @@ export class E2EEChannel {
       this.handshakeTimer = null
     }
 
-    // Why: transport-bound identity checks must complete before the peer sees
-    // authentication success; relay sockets additionally bind this context to
-    // their immutable relayDeviceId in the resolver.
     const readyResult = this.onReady(this, authenticatedDevice, authentication.auth)
     if (readyResult && !readyResult.ok) {
       this.sendEncryptedControl({ type: 'e2ee_error', error: { code: 'unauthorized' } })
@@ -352,9 +340,6 @@ export class E2EEChannel {
     this.v2Session = null
     this.messageHandler = null
     this.binaryMessageHandler = null
-    // Why: clear writableHandler so a late notifyWritable after destroy does
-    // not fire into a freed session, which would drain/re-pump a destroyed
-    // tunnel.
     this.writableHandler = null
     this.outbound.dispose()
   }

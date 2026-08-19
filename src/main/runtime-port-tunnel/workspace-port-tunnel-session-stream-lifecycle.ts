@@ -26,6 +26,10 @@ import {
 import type { WorkspacePortTunnelEgressFlow } from './workspace-port-tunnel-session-egress-flow'
 import type { WorkspacePortTunnelIngressCredit } from './workspace-port-tunnel-session-ingress-credit'
 import { enqueueSourceData, pumpEgress } from './workspace-port-tunnel-session-source-pump'
+import {
+  syncSourcePauseResume,
+  writeClientData
+} from './workspace-port-tunnel-session-ingress-write'
 
 export class StreamLifecycle {
   private readonly streams = new Map<number, ActiveStream>()
@@ -99,19 +103,15 @@ export class StreamLifecycle {
   }
 
   handleClientData(streamId: number, payload: Uint8Array): void {
-    const stream = this.streams.get(streamId)
-    if (!stream || !stream.installed || !stream.installed.controller.isWritable()) {
-      this.emit(buildResetFrame(streamId))
-      return
-    }
-    if (this.ingress.remainingWindow(streamId) < payload.byteLength) {
-      this.resetStream(streamId, true)
-      return
-    }
-    const accepted = stream.installed.controller.write(payload)
-    if (payload.byteLength > 0) {
-      this.returnIngressCredit(streamId, payload.byteLength, accepted)
-    }
+    writeClientData({
+      installed: this.streams.get(streamId)?.installed ?? null,
+      ingress: this.ingress,
+      emit: this.emit,
+      resetStream: () => this.resetStream(streamId, true),
+      emitUnknownReset: () => this.emit(buildResetFrame(streamId)),
+      streamId,
+      payload
+    })
   }
 
   handleOutboundFinSent(streamId: number): void {
@@ -146,7 +146,7 @@ export class StreamLifecycle {
     if (this.closed) {
       return
     }
-    this.syncSourcePauseResume()
+    syncSourcePauseResume(this.streams, this.egress)
     this.pump()
   }
 
@@ -286,34 +286,7 @@ export class StreamLifecycle {
       },
       this.isTransportBlocked
     )
-    this.syncSourcePauseResume()
-  }
-
-  // Why: pause the TCP source when the stream has no credit or hit the queue l...
-  private syncSourcePauseResume(): void {
-    for (const [streamId, stream] of this.streams) {
-      if (!stream.installed) {
-        continue
-      }
-      if (this.egress.isSourcePaused(streamId)) {
-        stream.installed.controller.pauseSource()
-      } else {
-        stream.installed.controller.resumeSource()
-      }
-    }
-  }
-
-  private returnIngressCredit(streamId: number, bytes: number, accepted: boolean): void {
-    const result = accepted
-      ? this.ingress.recordAccepted(streamId, bytes)
-      : this.ingress.recordPending(streamId, bytes)
-    if (!result.ok && result.reason === 'window-exceeded') {
-      this.resetStream(streamId, true)
-      return
-    }
-    if (result.ok && result.creditToReturn > 0) {
-      this.emit(encodeWindowUpdateFrame(streamId, result.creditToReturn))
-    }
+    syncSourcePauseResume(this.streams, this.egress)
   }
 
   private resetStream(streamId: number, sendReset: boolean): void {
